@@ -28,7 +28,7 @@ interface G2GTarget {
   category: string; // EZLoot category (overridden per-row for Arc Raiders)
   brandId: string;
   serviceId: string;
-  kind: "wow_gold" | "arc_items" | "poe2_currency";
+  kind: "wow_gold" | "arc_items" | "poe2_currency" | "osrs_gold";
 }
 
 const TARGETS: G2GTarget[] = [
@@ -44,6 +44,10 @@ const TARGETS: G2GTarget[] = [
   // Hardcore league pills yet). League and currency are parsed from the title:
   // "Fate of the Vaal Standard > Exalted Orb" → subkey="standard", item_key="Exalted Orb"
   { defaultGame: "poe2", category: "currency", brandId: "lgc_game_27013", serviceId: SVC_GOLD, kind: "poe2_currency" },
+  // OSRS gold — single global economy, no servers. G2G returns 1 aggregated
+  // row with the lowest seller price (unit_name="Mil" = USD per million GP).
+  // We divide by 1M to get the per-1-GP value EZLoot stores.
+  { defaultGame: "osrs", category: "gold", brandId: "lgc_game_19746", serviceId: SVC_GOLD, kind: "osrs_gold" },
 ];
 
 interface G2GOffer {
@@ -508,6 +512,69 @@ function normalizePoe2Offers(offers: G2GOffer[], target: G2GTarget): NormalizedR
   return rows;
 }
 
+// ---------------- OSRS gold ----------------
+
+// Per-million-GP plausibility caps. Real OSRS gold market: $0.13-$0.50/M
+// depending on platform + supply (botted floods bring it down, content
+// drops push it up). Anything outside is bundle stuffing or fake bait.
+const OSRS_MIN_USD_PER_MIL = 0.05;
+const OSRS_MAX_USD_PER_MIL = 1.0;
+
+/**
+ * OSRS has a single global economy — sellers don't list per server / faction.
+ * G2G's sls.g2g.com/offer/search returns a small set of aggregated rows (often
+ * just 1) with unit_name="Mil" (millions of GP). The per-1-GP value EZLoot
+ * stores is unit_price / 1,000,000.
+ *
+ * No title parsing needed — every legit OSRS row gets normalized to the
+ * canonical item_key "OSRS Gold" that the bag profile + SYSTEM_PROMPT use.
+ */
+function normalizeOsrsOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRow[] {
+  const prices: number[] = [];
+  let totalStock = 0;
+
+  for (const offer of offers) {
+    if (typeof offer.unit_price !== "number" || offer.unit_price <= 0) continue;
+    // unit_name should be "Mil" — bail if a future seller starts using a
+    // different denomination so we don't silently mis-scale.
+    if (offer.unit_name && offer.unit_name.toLowerCase() !== "mil") {
+      continue;
+    }
+    if (offer.unit_price < OSRS_MIN_USD_PER_MIL) continue;
+    if (offer.unit_price > OSRS_MAX_USD_PER_MIL) continue;
+    prices.push(offer.unit_price);
+    totalStock += offer.available_qty ?? offer.total_stock ?? 0;
+  }
+
+  if (prices.length === 0) return [];
+
+  prices.sort((a, b) => a - b);
+  const minPerMil = robustMin(prices);
+  const maxPerMil = prices[prices.length - 1];
+  const avgPerMil = prices.reduce((a, b) => a + b, 0) / prices.length;
+
+  // Convert all to per-single-GP (EZLoot's canonical storage unit).
+  const minPerGp = minPerMil / 1_000_000;
+  const maxPerGp = maxPerMil / 1_000_000;
+  const avgPerGp = avgPerMil / 1_000_000;
+
+  return [
+    {
+      game: target.defaultGame,
+      category: "gold",
+      item_key: "OSRS Gold",
+      subkey: null,
+      min_price_usd: minPerGp,
+      avg_price_usd: avgPerGp,
+      max_price_usd: maxPerGp,
+      // OSRS qty is in millions on G2G; convert to per-GP-equivalent for
+      // consistency with WoW (which uses null). Null is fine here — gold
+      // category never triggers the low-stock filter anyway.
+      qty: null,
+    },
+  ];
+}
+
 // ---------------- Fetch loop ----------------
 
 async function fetchAllOffers(
@@ -575,6 +642,9 @@ export const g2gAdapter: PricingAdapter = {
             break;
           case "poe2_currency":
             rows = normalizePoe2Offers(offers, target);
+            break;
+          case "osrs_gold":
+            rows = normalizeOsrsOffers(offers, target);
             break;
         }
 

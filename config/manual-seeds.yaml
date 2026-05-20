@@ -13,13 +13,13 @@
 # and source for audit trail.
 
 # ----- OSRS gold -----
-# Source: estimated from PlayerAuctions + G2G as of 2026-05-20.
-# Remove once the PlayerAuctions adapter is live and producing OSRS data.
-- game: osrs
-  category: gold
-  item_key: OSRS Gold
-  min_price_usd: 0.00000025
-  notes: "~$0.25/M; estimated 2026-05-20 — replace with live adapter"
+# Now sourced live from G2G adapter (src/adapters/g2g.ts kind:"osrs_gold").
+# Static seed kept only as a fallback if G2G is blocked/down for >48h.
+# - game: osrs
+#   category: gold
+#   item_key: OSRS Gold
+#   min_price_usd: 0.00000025
+#   notes: "~$0.25/M; fallback if G2G unreachable"
 
 # ----- Destiny 2 carries -----
 # G2G lists Destiny 2 carries but category taxonomy is inconsistent.
