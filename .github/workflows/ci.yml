@@ -1,14 +1,14 @@
-name: Deploy to Fly.io
+name: CI
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 jobs:
-  deploy:
-    name: Deploy
+  typecheck:
+    name: Typecheck + build
     runs-on: ubuntu-latest
-    concurrency: deploy-production
 
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +26,3 @@ jobs:
 
       - name: Build
         run: npm run build
-
-      - name: Deploy to Fly.io
-        uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - run: flyctl deploy --remote-only
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
