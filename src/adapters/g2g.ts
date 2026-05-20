@@ -52,13 +52,35 @@ const TARGETS: G2GTarget[] = [
 
 interface G2GOffer {
   title?: string;
+  /** The featured/first-shown seller's per-unit price. NOT what we want for
+   *  pricing — this is one specific seller, not the group minimum. */
   unit_price?: number;
+  /** The group's lowest per-unit price across all N sellers in this group
+   *  (see total_offer). THIS is the canonical "cheapest available" value
+   *  and what every quote should be built on. Matches display_price. */
+  converted_unit_price?: number;
+  display_price?: string;
+  /** When true, this row aggregates N sellers (see total_offer); use
+   *  converted_unit_price for the group minimum. When false (rare), it's a
+   *  single standalone listing and converted_unit_price still equals the
+   *  effective price. */
+  is_group_display?: boolean;
+  total_offer?: number;
   available_qty?: number;
   total_stock?: number;
   min_qty?: number;
   unit_name?: string;
   listing_id?: string;
   offer_attributes?: Array<Record<string, unknown>>;
+}
+
+/**
+ * The canonical per-unit price for a G2G offer. Prefers converted_unit_price
+ * (group minimum across all sellers) over unit_price (featured seller only).
+ * Falls back to unit_price if the new field isn't populated.
+ */
+function offerPrice(offer: G2GOffer): number | undefined {
+  return offer.converted_unit_price ?? offer.unit_price;
 }
 
 interface G2GSearchResponse {
@@ -147,10 +169,9 @@ function parseWowServerFaction(title: string): string | null {
 }
 
 /**
- * Gold-price sanity gate. G2G's `unit_price` for gold is per-1-gold.
- * Anything above $1/piece is structurally bogus — drop before aggregating.
- * (The EZLoot outlier filter would catch this anyway; we drop early so the
- *  per-row MIN isn't dragged up.)
+ * Gold-price sanity gate. G2G's `unit_price` for gold is per-1-gold-piece
+ * (matches `unit_name: "Gold"`). Anything above $1/piece is structurally
+ * bogus bundle stuffing — drop before aggregating.
  */
 function isPlausibleGoldUnitPrice(p: number | undefined): p is number {
   if (typeof p !== "number" || p <= 0) return false;
@@ -167,7 +188,10 @@ function normalizeGoldOffers(offers: G2GOffer[], target: G2GTarget): NormalizedR
   for (const offer of offers) {
     const title = offer.title?.trim() ?? "";
     if (!title) continue;
-    if (!isPlausibleGoldUnitPrice(offer.unit_price)) continue;
+    // Use the group-min price (across all N sellers in this server-faction
+    // group), not the featured seller's unit_price.
+    const price = offerPrice(offer);
+    if (!isPlausibleGoldUnitPrice(price)) continue;
 
     const itemKey = parseWowServerFaction(title);
     if (!itemKey) continue;
@@ -181,7 +205,7 @@ function normalizeGoldOffers(offers: G2GOffer[], target: G2GTarget): NormalizedR
         gameKey,
         itemKey,
       };
-      bucket.prices.push(offer.unit_price);
+      bucket.prices.push(price);
       bucket.stock += offer.available_qty ?? offer.total_stock ?? 0;
       grouped.set(key, bucket);
     }
@@ -316,11 +340,12 @@ function normalizeArcOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRo
     if (!title) continue;
     const parsed = parseArcTitle(title);
     if (!parsed) continue;
-    if (typeof offer.unit_price !== "number" || offer.unit_price <= 0) continue;
+    const price = offerPrice(offer);
+    if (typeof price !== "number" || price <= 0) continue;
     // Drop bundle-listing prices before aggregation — otherwise a single
     // $85K outlier becomes the row's MIN if it's the only listing for that
     // item, and a customer would get quoted $85K.
-    if (!isPlausibleArcPrice(parsed.category, offer.unit_price)) continue;
+    if (!isPlausibleArcPrice(parsed.category, price)) continue;
 
     const key = `${parsed.category}|${parsed.itemName.toLowerCase()}`;
     const bucket = grouped.get(key) ?? {
@@ -329,7 +354,7 @@ function normalizeArcOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRo
       category: parsed.category,
       itemName: stableKey(parsed.itemName),
     };
-    bucket.prices.push(offer.unit_price);
+    bucket.prices.push(price);
     bucket.stock += offer.available_qty ?? offer.total_stock ?? 0;
     grouped.set(key, bucket);
   }
@@ -474,10 +499,11 @@ function normalizePoe2Offers(offers: G2GOffer[], target: G2GTarget): NormalizedR
     if (!title) continue;
     const parsed = parsePoe2Title(title);
     if (!parsed) continue;
-    if (typeof offer.unit_price !== "number" || offer.unit_price <= 0) continue;
+    const price = offerPrice(offer);
+    if (typeof price !== "number" || price <= 0) continue;
 
     const currencyLower = parsed.currency.toLowerCase();
-    if (!isPlausiblePoe2Price(currencyLower, offer.unit_price)) continue;
+    if (!isPlausiblePoe2Price(currencyLower, price)) continue;
 
     const key = `${parsed.subkey}|${currencyLower}`;
     const bucket = grouped.get(key) ?? {
@@ -486,7 +512,7 @@ function normalizePoe2Offers(offers: G2GOffer[], target: G2GTarget): NormalizedR
       subkey: parsed.subkey,
       currency: stableKey(parsed.currency),
     };
-    bucket.prices.push(offer.unit_price);
+    bucket.prices.push(price);
     bucket.stock += offer.available_qty ?? offer.total_stock ?? 0;
     grouped.set(key, bucket);
   }
@@ -534,15 +560,16 @@ function normalizeOsrsOffers(offers: G2GOffer[], target: G2GTarget): NormalizedR
   let totalStock = 0;
 
   for (const offer of offers) {
-    if (typeof offer.unit_price !== "number" || offer.unit_price <= 0) continue;
+    const price = offerPrice(offer);
+    if (typeof price !== "number" || price <= 0) continue;
     // unit_name should be "Mil" — bail if a future seller starts using a
     // different denomination so we don't silently mis-scale.
     if (offer.unit_name && offer.unit_name.toLowerCase() !== "mil") {
       continue;
     }
-    if (offer.unit_price < OSRS_MIN_USD_PER_MIL) continue;
-    if (offer.unit_price > OSRS_MAX_USD_PER_MIL) continue;
-    prices.push(offer.unit_price);
+    if (price < OSRS_MIN_USD_PER_MIL) continue;
+    if (price > OSRS_MAX_USD_PER_MIL) continue;
+    prices.push(price);
     totalStock += offer.available_qty ?? offer.total_stock ?? 0;
   }
 
@@ -582,10 +609,13 @@ async function fetchAllOffers(
   target: G2GTarget
 ): Promise<G2GOffer[]> {
   const pageSize = 100;
-  const maxPages = 20;
+  // Hard safety cap to prevent runaway pagination if G2G ever returns a
+  // looping/infinite page count. Real brands top out around 50-100 pages
+  // (~5000-10000 offers). 500 = 50K offers — generous headroom.
+  const hardCap = 500;
   const offers: G2GOffer[] = [];
 
-  for (let page = 1; page <= maxPages; page++) {
+  for (let page = 1; page <= hardCap; page++) {
     if (page > 1) await sleep(1000 + Math.random() * 500);
 
     const url = buildSearchUrl(target.serviceId, target.brandId, page, pageSize);
@@ -601,7 +631,13 @@ async function fetchAllOffers(
     const results = resp?.payload?.results ?? resp?.results ?? [];
     if (results.length === 0) break;
     offers.push(...results);
+    // Natural termination: G2G returned fewer than a full page → no more data.
     if (results.length < pageSize) break;
+
+    // Visibility on long-running brands
+    if (page % 10 === 0) {
+      ctx.log.info("Still paginating", { brandId: target.brandId, page, totalOffersSoFar: offers.length });
+    }
   }
 
   return offers;
