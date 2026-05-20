@@ -228,24 +228,24 @@ const ARC_CATEGORY_MAP: Record<string, string> = {
 // into the per-unit field. Tuned against real prices observed on G2G as of
 // 2026-05-20 (see scripts/test-g2g.ts output).
 //
-// Real ranges:
-//   blueprints  $0.34 – ~$1.50   (cap from EZLoot's outlier filter: $0.01–$2)
-//   weapons     $0.39 – ~$5      (Tempest IV is $0.60; rare weapons rarely > $10)
-//   modification $0.20 – ~$3     (most $0.20–$0.50; rare slots maybe $5)
-//   materials   $0.007 – ~$5     (Explosive Compound is $5; nothing else > $1)
-//   recyclable  $0.14 – ~$2      (most under $0.20)
-//   keys        $1.00 – ~$15     (Buried City JKV is $15; rare keys maybe $50)
+// Real observed ranges:
+//   blueprints  $0.34 – $1.50   (matches EZLoot's outlier filter cap of $2)
+//   weapons     $0.25 – $5      (Tempest IV is $0.60; bundle outliers were $100)
+//   modification $0.20 – $15    (Stable Stock II is $15; bundles were $85K)
+//   materials   $0.007 – $5     (Explosive Compound is $5; bundles were $85K)
+//   recyclable  $0.14 – $9      (Broken Flashlight is $9; bundles were $84K)
+//   keys        $1.00 – $15     (Outskirts Bunker Key is $15; bundles were $100)
 //
-// Cap = upper bound for legitimate per-unit prices. We pick conservative
-// values that catch obvious bundles ($83K, $999) without rejecting rare
-// premium items.
+// Caps are tight (real max + a small buffer). Anything in this range is real;
+// anything above is bundle-stuffed pricing. If a new legitimately-expensive
+// item shows up, bump the cap.
 const ARC_CATEGORY_MAX_USD: Record<string, number> = {
   blueprints: 2,
-  weapons: 100,
-  modification: 50,
-  materials: 50,
-  recyclable: 50,
-  keys: 100,
+  weapons: 20,
+  modification: 20,
+  materials: 20,
+  recyclable: 20,
+  keys: 30,
 };
 const ARC_CATEGORY_MIN_USD: Record<string, number> = {
   blueprints: 0.01,
@@ -255,6 +255,18 @@ const ARC_CATEGORY_MIN_USD: Record<string, number> = {
   recyclable: 0.01,
   keys: 0.1,
 };
+
+/**
+ * When an item has 3+ listings, skip the absolute cheapest and use the
+ * 2nd-cheapest as the canonical min. Guards against fake-low listings where
+ * sellers post $0.001 as bait with no real stock. With 1–2 listings we don't
+ * have enough confidence to skip — use the raw min and trust the per-category
+ * caps.
+ */
+function robustMin(sortedPrices: number[]): number {
+  if (sortedPrices.length >= 3) return sortedPrices[1];
+  return sortedPrices[0];
+}
 
 function isPlausibleArcPrice(category: string, price: number): boolean {
   const max = ARC_CATEGORY_MAX_USD[category];
@@ -317,7 +329,7 @@ function normalizeArcOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRo
   for (const bucket of grouped.values()) {
     if (bucket.prices.length === 0) continue;
     bucket.prices.sort((a, b) => a - b);
-    const min = bucket.prices[0];
+    const min = robustMin(bucket.prices);
     const max = bucket.prices[bucket.prices.length - 1];
     const avg = bucket.prices.reduce((a, b) => a + b, 0) / bucket.prices.length;
     rows.push({
