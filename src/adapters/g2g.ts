@@ -2,61 +2,54 @@
  * G2G adapter — hits sls.g2g.com/offer/search and normalizes listings
  * into NormalizedRow[].
  *
- * Ported from lib/g2g-scrape.ts in the EZLoot repo (disabled per task #179).
- * Key fixes applied vs. the original:
+ * Tuned against real API responses (see scripts/debug-raw.ts output, 2026-05-20):
+ *   - WoW gold: `unit_price` is ALREADY USD per 1 gold piece. Use directly.
+ *   - Arc Raiders: titles are "All Platform > {Category} > {Item}" — parse to
+ *     get the EZLoot category. Listings without that shape are skipped (junk).
+ *   - WoW variant disambiguation: brand lgc_game_27816 covers Anniversary, SoD,
+ *     Hardcore, and Classic Era. Parse the [region - variant] bracket in the
+ *     server name to route each row to the right EZLoot game key.
  *   - EU region_id (ac3f85c1-7562-437e-b125-e89576b9a38e) is NEVER sent.
- *   - Gold rows normalize to USD per 1 gold piece (unit_price / available_qty).
- *   - EZLoot-canonical game keys (wow_classic_era_anniversary etc.) used throughout.
  */
 
 import type { PricingAdapter, AdapterContext, NormalizedRow } from "./types.js";
-
-// G2G brand_id → EZLoot canonical game key.
-// A single brand_id can cover multiple EZLoot variants (e.g. lgc_game_27816
-// covers anniversary, sod, hardcore, classic_era). We use the most-trafficked
-// variant as the primary key and rely on the server-faction-resolver in EZLoot
-// to disambiguate. v2: cross-reference wow_servers API to split by variant.
-const BRAND_TO_GAME: Record<string, string> = {
-  lgc_game_35181: "arc_raiders",
-  lgc_game_27816: "wow_classic_era_anniversary",
-  lgc_game_29076: "wow_mop_classic",
-  lgc_game_2299: "wow_retail",
-};
 
 // G2G service_id constants
 const SVC_GOLD = "lgc_service_1";
 const SVC_ITEMS = "0765978e-3fdf-48b4-bed3-184823aa439e";
 
 interface G2GTarget {
-  game: string;
-  category: string; // EZLoot category
+  /**
+   * Fallback EZLoot game key if no variant tag is found in the listing.
+   * For gold, the bracket parser usually sets the actual key per row;
+   * this default catches untagged listings.
+   */
+  defaultGame: string;
+  category: string; // EZLoot category (overridden per-row for Arc Raiders)
   brandId: string;
   serviceId: string;
-  isGold: boolean;
+  kind: "wow_gold" | "arc_items";
 }
 
 const TARGETS: G2GTarget[] = [
-  // WoW gold (all Classic-era variants share lgc_game_27816)
-  { game: "wow_classic_era_anniversary", category: "gold", brandId: "lgc_game_27816", serviceId: SVC_GOLD, isGold: true },
-  { game: "wow_mop_classic", category: "gold", brandId: "lgc_game_29076", serviceId: SVC_GOLD, isGold: true },
-  { game: "wow_retail", category: "gold", brandId: "lgc_game_2299", serviceId: SVC_GOLD, isGold: true },
-  // Arc Raiders items + blueprints
-  { game: "arc_raiders", category: "items", brandId: "lgc_game_35181", serviceId: SVC_ITEMS, isGold: false },
+  // WoW gold — single query per brand covers all sub-variants.
+  // The bracket parser splits results into the right EZLoot game key.
+  { defaultGame: "wow_classic_era", category: "gold", brandId: "lgc_game_27816", serviceId: SVC_GOLD, kind: "wow_gold" },
+  { defaultGame: "wow_mop_classic", category: "gold", brandId: "lgc_game_29076", serviceId: SVC_GOLD, kind: "wow_gold" },
+  { defaultGame: "wow_retail", category: "gold", brandId: "lgc_game_2299", serviceId: SVC_GOLD, kind: "wow_gold" },
+  // Arc Raiders items — category set per-row from title parsing.
+  { defaultGame: "arc_raiders", category: "items", brandId: "lgc_game_35181", serviceId: SVC_ITEMS, kind: "arc_items" },
 ];
 
 interface G2GOffer {
   title?: string;
-  offer_attributes?: Array<{
-    collection_id?: string;
-    collection_name?: string;
-    dataset_id?: string;
-    dataset_value?: string;
-    label?: string;
-  }>;
   unit_price?: number;
-  total_stock?: number;
   available_qty?: number;
+  total_stock?: number;
+  min_qty?: number;
+  unit_name?: string;
   listing_id?: string;
+  offer_attributes?: Array<Record<string, unknown>>;
 }
 
 interface G2GSearchResponse {
@@ -73,8 +66,7 @@ function buildSearchUrl(
   const u = new URL("https://sls.g2g.com/offer/search");
   u.searchParams.set("service_id", serviceId);
   u.searchParams.set("brand_id", brandId);
-  // DO NOT set region_id — the EU UUID (ac3f85c1-7562-437e-b125-e89576b9a38e)
-  // silently drops every non-EU listing. Omitting region_id returns all regions.
+  // DO NOT set region_id — the EU UUID silently drops every non-EU listing.
   u.searchParams.set("language", "en");
   u.searchParams.set("country", "US");
   u.searchParams.set("currency", "USD");
@@ -84,106 +76,284 @@ function buildSearchUrl(
   return u.toString();
 }
 
-/** Pull an offer attribute value by label (case-insensitive). */
-function attr(offer: G2GOffer, label: string): string | null {
-  const found = offer.offer_attributes?.find(
-    (a) => a.label?.toLowerCase() === label.toLowerCase()
-  );
-  return found?.dataset_value ?? null;
-}
+const stableKey = (s: string) => s.replace(/\s+/g, " ").trim();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------- WoW gold ----------------
 
 /**
- * Try to extract server + faction from a WoW gold listing.
- * G2G offer_attributes often have structured "Server" and "Faction" fields.
- * Falls back to title parsing.
+ * Determine the EZLoot game key(s) a WoW gold listing should be emitted under.
  *
- * Returns null when we can't extract both confidently.
+ * Returns an ARRAY because some untagged listings should be emitted under
+ * multiple keys. The brand `lgc_game_27816` covers four variants (Anniversary,
+ * SoD, Hardcore, Classic Era proper) sharing the same brand_id. Sellers tag
+ * some listings explicitly (`[US - Seasonal]` = SoD) but most just say `[US]`.
+ *
+ * Server names are globally unique across variants (Pagle is only on Anniversary,
+ * Whitemane is only on Classic Era, Skull Rock only on Hardcore, etc.), so
+ * cross-emitting an untagged row under multiple variant keys is safe — the
+ * resolver still matches the right realm by name, and the frontend prevents
+ * customers from selecting impossible variant+realm combos.
+ *
+ * Examples:
+ *   "Lava Lash [US - Seasonal] - Horde"   → [wow_sod]
+ *   "Pagle [US - Anniversary] - Alliance" → [wow_classic_era_anniversary]
+ *   "Stitches [EU - Hardcore] - Horde"    → [wow_hardcore]
+ *   "Pagle [US] - Alliance"               → [wow_classic_era_anniversary, wow_classic_era]
+ *   "Auberdine [FR] - Horde"              → [wow_classic_era_anniversary, wow_classic_era]
  */
-function extractGoldKey(offer: G2GOffer): { itemKey: string; faction: string } | null {
-  // Prefer structured attributes
-  const server = attr(offer, "server") ?? attr(offer, "realm");
-  const faction = attr(offer, "faction") ?? attr(offer, "side");
-
-  if (server && faction) {
-    return {
-      itemKey: `${server.trim()} - ${faction.trim()}`,
-      faction: faction.trim(),
-    };
+function wowVariantsFromTitle(title: string, fallback: string): string[] {
+  const bracket = title.match(/\[([^\]]+)\]/);
+  if (!bracket) return [fallback];
+  const tag = bracket[1].toLowerCase();
+  if (/anniversary/.test(tag)) return ["wow_classic_era_anniversary"];
+  if (/seasonal|sod|season of discovery/.test(tag)) return ["wow_sod"];
+  if (/hardcore/.test(tag)) return ["wow_hardcore"];
+  // Region-only tag (no variant qualifier) — emit under both Anniversary
+  // (the active customer-facing variant) and Classic Era proper. Server-name
+  // uniqueness keeps this safe; the resolver will pick the right one.
+  if (/^(us|eu|fr|de|cn|kr|ru|oce)( - .*)?$/.test(tag)) {
+    return ["wow_classic_era_anniversary", "wow_classic_era"];
   }
+  return [fallback];
+}
 
-  // Fall back to title parsing
-  const title = offer.title?.trim() ?? "";
-  if (!title) return null;
-
+/** Extract "{Server} - {Faction}" from a WoW gold title. */
+function parseWowServerFaction(title: string): string | null {
   const factionMatch = title.match(/\b(alliance|horde)\b/i);
   if (!factionMatch) return null;
-
-  const detectedFaction = factionMatch[1];
-  // Strip faction name + common noise words to get server name
-  let serverName = title
-    .replace(new RegExp(`\\b${detectedFaction}\\b`, "i"), "")
-    .replace(/\bgold\b|\bwow\b|\bcoins?\b|\binstant\b|\bdelivery\b|\bfast\b/gi, "")
-    .replace(/[|,\-]+/g, " ")
+  const faction = factionMatch[1];
+  // Title shape is consistently "Server [bracket] - Faction" or
+  // "Server - Faction". Strip the bracket and faction suffix to get server.
+  let server = title
+    .replace(/\s*\[[^\]]*\]\s*/g, " ")
+    .replace(new RegExp(`\\s*-?\\s*${faction}\\s*$`, "i"), "")
     .replace(/\s+/g, " ")
     .trim();
-
-  if (!serverName) return null;
-
-  return {
-    itemKey: `${serverName} - ${detectedFaction}`,
-    faction: detectedFaction,
-  };
+  if (!server) return null;
+  // Title-case the faction for stable joins
+  const factionTitle = faction.charAt(0).toUpperCase() + faction.slice(1).toLowerCase();
+  return `${server} - ${factionTitle}`;
 }
 
 /**
- * Per-gold-piece price from a G2G offer.
- *
- * G2G gold listings price in USD for a block of gold. The `unit_price` field
- * is the price for the listed quantity (`available_qty` gold pieces).
- * Dividing gives USD per 1 gold piece — the unit EZLoot stores.
- *
- * TODO: Verify against real API responses. If G2G's unit_price is already
- * per-1K-gold, adjust the divisor. The outlier filter (cap $1/piece) catches
- * wildly wrong values, so bad conversions surface quickly.
+ * Gold-price sanity gate. G2G's `unit_price` for gold is per-1-gold.
+ * Anything above $1/piece is structurally bogus — drop before aggregating.
+ * (The EZLoot outlier filter would catch this anyway; we drop early so the
+ *  per-row MIN isn't dragged up.)
  */
-function goldPricePerPiece(offer: G2GOffer): number | null {
-  const price = offer.unit_price;
-  const qty = offer.available_qty ?? offer.total_stock;
-  if (!price || price <= 0) return null;
-  if (!qty || qty <= 0) return null;
-  return price / qty;
+function isPlausibleGoldUnitPrice(p: number | undefined): p is number {
+  if (typeof p !== "number" || p <= 0) return false;
+  if (p > 1) return false;
+  return true;
 }
 
-/** Stable item_key — collapse whitespace, trim. */
-const stableKey = (s: string) => s.replace(/\s+/g, " ").trim();
+function normalizeGoldOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRow[] {
+  // Group by (gameKey, itemKey). Untagged listings expand into multiple
+  // gameKey buckets so the resolver can find them under any variant the
+  // customer happens to be on.
+  const grouped = new Map<string, { prices: number[]; stock: number; gameKey: string; itemKey: string }>();
+
+  for (const offer of offers) {
+    const title = offer.title?.trim() ?? "";
+    if (!title) continue;
+    if (!isPlausibleGoldUnitPrice(offer.unit_price)) continue;
+
+    const itemKey = parseWowServerFaction(title);
+    if (!itemKey) continue;
+
+    const variants = wowVariantsFromTitle(title, target.defaultGame);
+    for (const gameKey of variants) {
+      const key = `${gameKey}|${itemKey}`;
+      const bucket = grouped.get(key) ?? {
+        prices: [],
+        stock: 0,
+        gameKey,
+        itemKey,
+      };
+      bucket.prices.push(offer.unit_price);
+      bucket.stock += offer.available_qty ?? offer.total_stock ?? 0;
+      grouped.set(key, bucket);
+    }
+  }
+
+  const rows: NormalizedRow[] = [];
+  for (const bucket of grouped.values()) {
+    if (bucket.prices.length === 0) continue;
+    bucket.prices.sort((a, b) => a - b);
+    const min = bucket.prices[0];
+    const max = bucket.prices[bucket.prices.length - 1];
+    const avg = bucket.prices.reduce((a, b) => a + b, 0) / bucket.prices.length;
+    rows.push({
+      game: bucket.gameKey,
+      category: "gold",
+      item_key: bucket.itemKey,
+      subkey: null,
+      min_price_usd: min,
+      avg_price_usd: avg,
+      max_price_usd: max,
+      // Gold qty = null: EZLoot's outlier filter only checks qty for stock
+      // sanity on items. For gold we'd need millions to be "low stock" and
+      // the field would just give false positives.
+      qty: null,
+    });
+  }
+  return rows;
+}
+
+// ---------------- Arc Raiders items ----------------
+
+// Canonical EZLoot categories (from CLAUDE.md: blueprints / weapons /
+// modification / materials / keys / recyclable). G2G uses near-matching
+// strings in its titles — this map normalizes them.
+const ARC_CATEGORY_MAP: Record<string, string> = {
+  blueprints: "blueprints",
+  blueprint: "blueprints",
+  weapons: "weapons",
+  weapon: "weapons",
+  modification: "modification",
+  modifications: "modification",
+  mods: "modification",
+  materials: "materials",
+  material: "materials",
+  keys: "keys",
+  key: "keys",
+  recyclable: "recyclable",
+  recyclables: "recyclable",
+};
+
+// Per-category plausibility caps for Arc Raiders. Anything outside these is
+// almost certainly a bundle listing where the seller stuffed a per-pack price
+// into the per-unit field. Tuned against real prices observed on G2G as of
+// 2026-05-20 (see scripts/test-g2g.ts output).
+//
+// Real ranges:
+//   blueprints  $0.34 – ~$1.50   (cap from EZLoot's outlier filter: $0.01–$2)
+//   weapons     $0.39 – ~$5      (Tempest IV is $0.60; rare weapons rarely > $10)
+//   modification $0.20 – ~$3     (most $0.20–$0.50; rare slots maybe $5)
+//   materials   $0.007 – ~$5     (Explosive Compound is $5; nothing else > $1)
+//   recyclable  $0.14 – ~$2      (most under $0.20)
+//   keys        $1.00 – ~$15     (Buried City JKV is $15; rare keys maybe $50)
+//
+// Cap = upper bound for legitimate per-unit prices. We pick conservative
+// values that catch obvious bundles ($83K, $999) without rejecting rare
+// premium items.
+const ARC_CATEGORY_MAX_USD: Record<string, number> = {
+  blueprints: 2,
+  weapons: 100,
+  modification: 50,
+  materials: 50,
+  recyclable: 50,
+  keys: 100,
+};
+const ARC_CATEGORY_MIN_USD: Record<string, number> = {
+  blueprints: 0.01,
+  weapons: 0.05,
+  modification: 0.05,
+  materials: 0.001,
+  recyclable: 0.01,
+  keys: 0.1,
+};
+
+function isPlausibleArcPrice(category: string, price: number): boolean {
+  const max = ARC_CATEGORY_MAX_USD[category];
+  const min = ARC_CATEGORY_MIN_USD[category];
+  if (max !== undefined && price > max) return false;
+  if (min !== undefined && price < min) return false;
+  return true;
+}
+
+/**
+ * Parse an Arc Raiders G2G title into { category, itemName }.
+ * Real titles are "All Platform > Materials > Plastic Parts" — anything
+ * that doesn't fit that shape is a junk/bundle listing and returns null.
+ */
+function parseArcTitle(title: string): { category: string; itemName: string } | null {
+  // Must have at least one ">" — junk listings rarely use this format.
+  const parts = title.split(">").map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  // Last segment = item name. Second-to-last (or first) = category.
+  const itemName = parts[parts.length - 1];
+  // Category is typically parts[parts.length - 2] for "Platform > Category > Item"
+  // or parts[0] for "Category > Item".
+  const categoryRaw = parts.length >= 3
+    ? parts[parts.length - 2]
+    : parts[0];
+  const category = ARC_CATEGORY_MAP[categoryRaw.toLowerCase()];
+  if (!category) return null;
+  if (!itemName) return null;
+  return { category, itemName };
+}
+
+function normalizeArcOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRow[] {
+  // Group by (category, itemName)
+  const grouped = new Map<string, { prices: number[]; stock: number; category: string; itemName: string }>();
+
+  for (const offer of offers) {
+    const title = offer.title?.trim() ?? "";
+    if (!title) continue;
+    const parsed = parseArcTitle(title);
+    if (!parsed) continue;
+    if (typeof offer.unit_price !== "number" || offer.unit_price <= 0) continue;
+    // Drop bundle-listing prices before aggregation — otherwise a single
+    // $85K outlier becomes the row's MIN if it's the only listing for that
+    // item, and a customer would get quoted $85K.
+    if (!isPlausibleArcPrice(parsed.category, offer.unit_price)) continue;
+
+    const key = `${parsed.category}|${parsed.itemName.toLowerCase()}`;
+    const bucket = grouped.get(key) ?? {
+      prices: [],
+      stock: 0,
+      category: parsed.category,
+      itemName: stableKey(parsed.itemName),
+    };
+    bucket.prices.push(offer.unit_price);
+    bucket.stock += offer.available_qty ?? offer.total_stock ?? 0;
+    grouped.set(key, bucket);
+  }
+
+  const rows: NormalizedRow[] = [];
+  for (const bucket of grouped.values()) {
+    if (bucket.prices.length === 0) continue;
+    bucket.prices.sort((a, b) => a - b);
+    const min = bucket.prices[0];
+    const max = bucket.prices[bucket.prices.length - 1];
+    const avg = bucket.prices.reduce((a, b) => a + b, 0) / bucket.prices.length;
+    rows.push({
+      game: target.defaultGame,
+      category: bucket.category,
+      item_key: bucket.itemName,
+      subkey: null,
+      min_price_usd: min,
+      avg_price_usd: avg,
+      max_price_usd: max,
+      qty: bucket.stock > 0 ? bucket.stock : null,
+    });
+  }
+  return rows;
+}
+
+// ---------------- Fetch loop ----------------
 
 async function fetchAllOffers(
   ctx: AdapterContext,
   target: G2GTarget
 ): Promise<G2GOffer[]> {
   const pageSize = 100;
-  const maxPages = 15;
+  const maxPages = 20;
   const offers: G2GOffer[] = [];
-
-  // Polite rate-limit: 1 req/sec with jitter between pages.
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   for (let page = 1; page <= maxPages; page++) {
     if (page > 1) await sleep(1000 + Math.random() * 500);
 
     const url = buildSearchUrl(target.serviceId, target.brandId, page, pageSize);
-    ctx.log.debug("Fetching G2G page", { page, game: target.game, category: target.category });
-
     let resp: G2GSearchResponse;
     try {
       const res = await ctx.http.fetch(url);
       resp = (await res.json()) as G2GSearchResponse;
     } catch (err) {
-      ctx.log.warn("G2G page fetch failed", {
-        page,
-        game: target.game,
-        error: String(err),
-      });
+      ctx.log.warn("G2G page fetch failed", { page, brandId: target.brandId, error: String(err) });
       break;
     }
 
@@ -196,84 +366,6 @@ async function fetchAllOffers(
   return offers;
 }
 
-function normalizeGoldOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRow[] {
-  // Group by extracted server-faction key
-  const grouped = new Map<string, number[]>();
-
-  for (const offer of offers) {
-    const extracted = extractGoldKey(offer);
-    if (!extracted) continue;
-
-    const key = stableKey(extracted.itemKey);
-    const pricePerPiece = goldPricePerPiece(offer);
-    if (pricePerPiece == null || pricePerPiece <= 0) continue;
-
-    const arr = grouped.get(key) ?? [];
-    arr.push(pricePerPiece);
-    grouped.set(key, arr);
-  }
-
-  const rows: NormalizedRow[] = [];
-  for (const [itemKey, prices] of grouped) {
-    if (prices.length === 0) continue;
-    prices.sort((a, b) => a - b);
-    const min = prices[0];
-    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-    const max = prices[prices.length - 1];
-    rows.push({
-      game: target.game,
-      category: target.category,
-      item_key: itemKey,
-      subkey: null,
-      min_price_usd: min,
-      avg_price_usd: avg,
-      max_price_usd: max,
-      qty: prices.length,
-    });
-  }
-  return rows;
-}
-
-function normalizeItemOffers(offers: G2GOffer[], target: G2GTarget): NormalizedRow[] {
-  const grouped = new Map<string, G2GOffer[]>();
-
-  for (const offer of offers) {
-    const title = stableKey(offer.title ?? "");
-    if (!title) continue;
-    const arr = grouped.get(title) ?? [];
-    arr.push(offer);
-    grouped.set(title, arr);
-  }
-
-  const rows: NormalizedRow[] = [];
-  for (const [title, group] of grouped) {
-    const prices = group
-      .map((o) => o.unit_price)
-      .filter((p): p is number => typeof p === "number" && p > 0);
-    if (prices.length === 0) continue;
-    prices.sort((a, b) => a - b);
-    const min = prices[0];
-    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-    const max = prices[prices.length - 1];
-    const qty = group.reduce(
-      (acc, o) => acc + (o.available_qty ?? o.total_stock ?? 0),
-      0
-    ) || null;
-    rows.push({
-      game: target.game,
-      category: target.category,
-      item_key: title,
-      subkey: null,
-      min_price_usd: min,
-      avg_price_usd: avg,
-      max_price_usd: max,
-      qty,
-    });
-  }
-  return rows;
-}
-
-// Inter-target sleep to be polite to G2G. Random between 2–4 seconds.
 const betweenTargetsSleep = () =>
   new Promise((r) => setTimeout(r, 2000 + Math.random() * 2000));
 
@@ -282,36 +374,30 @@ export const g2gAdapter: PricingAdapter = {
   name: "G2G (sls.g2g.com/offer/search)",
 
   coverage() {
-    return TARGETS.map((t) => ({ game: t.game, category: t.category }));
+    return TARGETS.map((t) => ({ game: t.defaultGame, category: t.category }));
   },
 
   async fetch(ctx) {
-    const enabledTargets = TARGETS.filter((t) => {
-      const key = `${t.game}.${t.category}`;
-      const disabled = ctx.config.disabled_targets as string[] | undefined;
-      return !disabled?.includes(key);
-    });
-
     const allRows: NormalizedRow[] = [];
 
-    for (let i = 0; i < enabledTargets.length; i++) {
-      const target = enabledTargets[i];
+    for (let i = 0; i < TARGETS.length; i++) {
+      const target = TARGETS[i];
       if (i > 0) await betweenTargetsSleep();
 
       ctx.log.info("Scraping G2G target", {
-        game: target.game,
-        category: target.category,
+        brandId: target.brandId,
+        kind: target.kind,
       });
 
       try {
         const offers = await fetchAllOffers(ctx, target);
-        const rows = target.isGold
+        const rows = target.kind === "wow_gold"
           ? normalizeGoldOffers(offers, target)
-          : normalizeItemOffers(offers, target);
+          : normalizeArcOffers(offers, target);
 
         ctx.log.info("G2G target done", {
-          game: target.game,
-          category: target.category,
+          brandId: target.brandId,
+          kind: target.kind,
           offers: offers.length,
           rows: rows.length,
         });
@@ -319,11 +405,9 @@ export const g2gAdapter: PricingAdapter = {
         allRows.push(...rows);
       } catch (err) {
         ctx.log.error("G2G target failed", {
-          game: target.game,
-          category: target.category,
+          brandId: target.brandId,
           error: String(err),
         });
-        // Non-fatal — continue other targets
       }
     }
 
