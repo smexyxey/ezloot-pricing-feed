@@ -1,0 +1,13 @@
+# Adapter configuration for ezloot-pricing-feed.
+# Changes here take effect on the next process restart.
+
+g2g:
+  enabled: true
+  # Targets to skip on this run (useful when debugging a specific game).
+  # Format: "game.category", e.g. "wow_retail.gold"
+  disabled_targets: []
+
+manual_seed:
+  enabled: true
+  # Override seeds file path (default: config/manual-seeds.yaml)
+  # seeds_path: /etc/ezloot/manual-seeds.yaml

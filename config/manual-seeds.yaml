@@ -1,0 +1,51 @@
+# Manual price seeds — operator-set fallbacks for games or items where no
+# marketplace has reliable automated listings.
+#
+# Fields:
+#   game         - EZLoot canonical game key (e.g. "destiny2", "osrs")
+#   category     - EZLoot category (e.g. "carry", "gold", "items")
+#   item_key     - item or service name (must match what the bot produces)
+#   subkey       - optional: server/region/tier that disambiguates listings
+#   min_price_usd - USD per unit (per-1-gold for gold, per-item for carries)
+#   notes        - free-text explanation (not stored in DB)
+#
+# All prices are reviewed and updated manually. Add "notes" with the date
+# and source for audit trail.
+
+# ----- OSRS gold -----
+# Source: estimated from PlayerAuctions + G2G as of 2026-05-20.
+# Remove once the PlayerAuctions adapter is live and producing OSRS data.
+- game: osrs
+  category: gold
+  item_key: OSRS Gold
+  min_price_usd: 0.00000025
+  notes: "~$0.25/M; estimated 2026-05-20 — replace with live adapter"
+
+# ----- Destiny 2 carries -----
+# G2G lists Destiny 2 carries but category taxonomy is inconsistent.
+# Seeded here so the bot can quote basic carries until a D2 adapter lands.
+- game: destiny2
+  category: carry
+  item_key: Vault of the Mountain raid (Normal)
+  min_price_usd: 25.00
+  notes: "Operator-set 2026-05-20; check against G2G periodically"
+
+- game: destiny2
+  category: carry
+  item_key: Vault of the Mountain raid (Master)
+  min_price_usd: 45.00
+  notes: "Operator-set 2026-05-20"
+
+- game: destiny2
+  category: carry
+  item_key: Grandmaster Nightfall
+  min_price_usd: 15.00
+  notes: "Operator-set 2026-05-20"
+
+# ----- PoE 2 currency -----
+# Early-access price — highly volatile. Update after league start.
+- game: poe2
+  category: currency
+  item_key: Divine Orb
+  min_price_usd: 2.50
+  notes: "Operator-set 2026-05-20; PoE2 prices move fast on patch days"
