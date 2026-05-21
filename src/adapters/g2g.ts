@@ -549,8 +549,15 @@ const OSRS_MAX_USD_PER_MIL = 1.0;
 /**
  * OSRS has a single global economy — sellers don't list per server / faction.
  * G2G's sls.g2g.com/offer/search returns a small set of aggregated rows (often
- * just 1) with unit_name="Mil" (millions of GP). The per-1-GP value EZLoot
- * stores is unit_price / 1,000,000.
+ * just 1) with unit_name="Mil" (millions of GP).
+ *
+ * Storage convention: we keep G2G's per-1M-GP value as-is in
+ * pricing_intel.min_price_usd. The OSRS bag profile expresses its
+ * quantity in millions of GP (a "1" means 1M, "21" means 21M), and the
+ * quote engine multiplies qty × price to get total. This avoids the
+ * sub-cent precision trap that per-1-GP storage would create
+ * ($0.0000005/GP rounds to zero across many integer-rounding points
+ * in the quote pipeline).
  *
  * No title parsing needed — every legit OSRS row gets normalized to the
  * canonical item_key "OSRS Gold" that the bag profile + SYSTEM_PROMPT use.
@@ -580,23 +587,17 @@ function normalizeOsrsOffers(offers: G2GOffer[], target: G2GTarget): NormalizedR
   const maxPerMil = prices[prices.length - 1];
   const avgPerMil = prices.reduce((a, b) => a + b, 0) / prices.length;
 
-  // Convert all to per-single-GP (EZLoot's canonical storage unit).
-  const minPerGp = minPerMil / 1_000_000;
-  const maxPerGp = maxPerMil / 1_000_000;
-  const avgPerGp = avgPerMil / 1_000_000;
-
   return [
     {
       game: target.defaultGame,
       category: "gold",
       item_key: "OSRS Gold",
       subkey: null,
-      min_price_usd: minPerGp,
-      avg_price_usd: avgPerGp,
-      max_price_usd: maxPerGp,
-      // OSRS qty is in millions on G2G; convert to per-GP-equivalent for
-      // consistency with WoW (which uses null). Null is fine here — gold
-      // category never triggers the low-stock filter anyway.
+      // Store per-1M-GP (matches G2G's native unit_name="Mil"). The
+      // OSRS bag's quantity is also in millions; quote = qty_M × price_per_M.
+      min_price_usd: minPerMil,
+      avg_price_usd: avgPerMil,
+      max_price_usd: maxPerMil,
       qty: null,
     },
   ];
